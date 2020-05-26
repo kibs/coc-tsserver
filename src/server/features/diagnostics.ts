@@ -147,6 +147,7 @@ export class DiagnosticsManager {
           // Still show unused
           return x.code == 6133
         }
+        if (x.code == 7016) return false;
         return enabled
       })
   }
