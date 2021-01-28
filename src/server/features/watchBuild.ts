@@ -1,6 +1,4 @@
-import { disposeAll, StatusBarItem, TaskOptions, Uri, workspace } from 'coc.nvim'
-import { CommandManager } from 'coc.nvim/lib/commands'
-import Task from 'coc.nvim/lib/model/task'
+import { commands, disposeAll, StatusBarItem, TaskOptions, Uri, window, workspace } from 'coc.nvim'
 import path from 'path'
 import { Disposable, Location } from 'vscode-languageserver-protocol'
 import TypeScriptServiceClient from '../typescriptServiceClient'
@@ -26,22 +24,21 @@ export default class WatchProject implements Disposable {
   public static readonly id: string = 'tsserver.watchBuild'
   public static readonly startTexts: string[] = ['Starting compilation in watch mode', 'Starting incremental compilation']
   private statusItem: StatusBarItem
-  private task: Task
+  private task: any
   private options: TaskOptions
 
   public constructor(
-    commandManager: CommandManager,
     private client: TypeScriptServiceClient
   ) {
-    this.statusItem = workspace.createStatusBarItem(1, { progress: true })
+    this.statusItem = window.createStatusBarItem(1, { progress: true })
     let task = this.task = workspace.createTask('TSC')
-    this.disposables.push(commandManager.registerCommand(WatchProject.id, async () => {
+    this.disposables.push(commands.registerCommand(WatchProject.id, async () => {
       let opts = this.options = await this.getOptions()
       await this.start(opts)
     }))
     task.onExit(code => {
       if (code != 0) {
-        workspace.showMessage(`TSC exit with code ${code}`, 'warning')
+        window.showMessage(`TSC exit with code ${code}`, 'warning')
       }
       this.onStop()
     })
@@ -51,7 +48,7 @@ export default class WatchProject implements Disposable {
       }
     })
     task.onStderr(lines => {
-      workspace.showMessage(`TSC error: ` + lines.join('\n'), 'error')
+      window.showMessage(`TSC error: ` + lines.join('\n'), 'error')
     })
     this.disposables.push(Disposable.create(() => {
       task.dispose()
@@ -117,12 +114,12 @@ export default class WatchProject implements Disposable {
   public async getOptions(): Promise<TaskOptions> {
     let { tscPath } = this.client
     if (!tscPath) {
-      workspace.showMessage(`Local & global tsc not found`, 'error')
+      window.showMessage(`Local & global tsc not found`, 'error')
       return
     }
     let find = await workspace.findUp(['tsconfig.json'])
     if (!find) {
-      workspace.showMessage('tsconfig.json not found!', 'error')
+      window.showMessage('tsconfig.json not found!', 'error')
       return
     }
     let root = path.dirname(find)

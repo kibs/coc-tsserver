@@ -1,16 +1,17 @@
-import { Uri, StatusBarItem, workspace, events } from 'coc.nvim'
+import { events, StatusBarItem, Uri, window, workspace } from 'coc.nvim'
 import { Disposable } from 'vscode-languageserver-protocol'
 import { TypeScriptVersion } from './versionProvider'
 
 export default class VersionStatus {
   private readonly _onChangeEditorSub: Disposable
   private readonly _versionBarEntry: StatusBarItem
+  private _versionString = ''
 
   constructor(
     private readonly _normalizePath: (resource: Uri) => string | null,
     private readonly enableJavascript: boolean
   ) {
-    this._versionBarEntry = workspace.createStatusBarItem(99)
+    this._versionBarEntry = window.createStatusBarItem(99)
     this._onChangeEditorSub = events.on('BufEnter', this.onBufEnter, this)
     this._versionBarEntry.show()
   }
@@ -20,11 +21,16 @@ export default class VersionStatus {
     this._onChangeEditorSub.dispose()
   }
 
-  public onDidChangeTypeScriptVersion(_version: TypeScriptVersion): void {
-    this._versionBarEntry.text = `TSC`
+  public onDidChangeTypeScriptVersion(version: TypeScriptVersion): void {
+    this._versionString = version.versionString
   }
 
   public set loading(isLoading: boolean) {
+    if (isLoading) {
+      this._versionBarEntry.text = `Initialing tsserver ${this._versionString}`
+    } else {
+      this._versionBarEntry.text = `TSC ${this._versionString}`
+    }
     this._versionBarEntry.isProgress = isLoading
   }
 

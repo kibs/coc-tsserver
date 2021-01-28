@@ -3,32 +3,39 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 import cp from 'child_process'
+import { ServiceStat, Uri, window, workspace } from 'coc.nvim'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
-import { CancellationToken, Disposable, Emitter, Event } from 'vscode-languageserver-protocol'
-import which from 'which'
-import { Uri, ServiceStat, workspace, disposeAll } from 'coc.nvim'
+import { CancellationToken, CancellationTokenSource, Disposable, Emitter, Event } from 'vscode-languageserver-protocol'
+import * as fileSchemes from '../utils/fileSchemess'
+import { PluginManager } from '../utils/plugins'
+import { CallbackMap } from './callbackMap'
+import BufferSyncSupport from './features/bufferSyncSupport'
+import { DiagnosticKind, DiagnosticsManager } from './features/diagnostics'
 import FileConfigurationManager from './features/fileConfigurationManager'
 import * as Proto from './protocol'
-import { ITypeScriptServiceClient, ServerResponse } from './typescriptService'
+import { RequestItem, RequestQueue, RequestQueueingType } from './requestQueue'
+import { ExecConfig, ITypeScriptServiceClient, ServerResponse } from './typescriptService'
 import API from './utils/api'
 import { TsServerLogLevel, TypeScriptServiceConfiguration } from './utils/configuration'
 import Logger from './utils/logger'
-import { fork, getTempFile, getTempDirectory, IForkOptions, makeRandomHexString } from './utils/process'
+import { fork, getTempDirectory, getTempFile, IForkOptions, makeRandomHexString } from './utils/process'
 import Tracer from './utils/tracer'
 import { inferredProjectConfig } from './utils/tsconfig'
 import { TypeScriptVersion, TypeScriptVersionProvider } from './utils/versionProvider'
 import VersionStatus from './utils/versionStatus'
-import { PluginManager } from '../utils/plugins'
 import { ICallback, Reader } from './utils/wireProtocol'
-import { CallbackMap } from './callbackMap'
-import { RequestItem, RequestQueue, RequestQueueingType } from './requestQueue'
-import BufferSyncSupport from './features/bufferSyncSupport'
-import { DiagnosticKind, DiagnosticsManager } from './features/diagnostics'
+
+interface ToCancelOnResourceChanged {
+  readonly resource: string
+  cancel(): void
+}
 
 class ForkedTsServerProcess {
-  constructor(private childProcess: cp.ChildProcess) { }
+  constructor(private childProcess: cp.ChildProcess) {}
+
+  public readonly toCancelOnResourceChange = new Set<ToCancelOnResourceChanged>()
 
   public onError(cb: (err: Error) => void): void {
     this.childProcess.on('error', cb)
@@ -76,6 +83,7 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
   private _configuration: TypeScriptServiceConfiguration
   private versionProvider: TypeScriptVersionProvider
   private tsServerLogFile: string | null = null
+  private tsServerProcess: ForkedTsServerProcess | undefined
   private servicePromise: Thenable<ForkedTsServerProcess> | null
   private lastError: Error | null
   private lastStart: number
@@ -98,7 +106,10 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
   private readonly disposables: Disposable[] = []
   private isRestarting = false
 
-  constructor(private pluginManager: PluginManager) {
+  constructor(
+    public readonly pluginManager: PluginManager,
+    public readonly modeIds: string[]
+  ) {
     this.pathSeparator = path.sep
     this.lastStart = Date.now()
     this.servicePromise = null
@@ -118,15 +129,19 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
       this.restartTsServer()
     }, null, this.disposables)
 
-    this.bufferSyncSupport = new BufferSyncSupport(this)
+    this.bufferSyncSupport = new BufferSyncSupport(this, modeIds)
     this.onTsServerStarted(() => {
       this.bufferSyncSupport.listen()
     })
 
     this.diagnosticsManager = new DiagnosticsManager()
     this.bufferSyncSupport.onDelete(resource => {
+      this.cancelInflightRequestsForResource(resource)
       this.diagnosticsManager.delete(resource)
     }, null, this.disposables)
+    this.bufferSyncSupport.onWillChange(resource => {
+      this.cancelInflightRequestsForResource(resource)
+    })
   }
 
   private _onDiagnosticsReceived = new Emitter<TsDiagnostics>()
@@ -157,7 +172,6 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
         .then(undefined, () => void 0)
     }
     this.bufferSyncSupport.dispose()
-    disposeAll(this.disposables)
     this.logger.dispose()
     this._onTsServerStarted.dispose()
     this._onResendModelsRequested.dispose()
@@ -256,7 +270,7 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
   public ensureServiceStarted(): void {
     if (!this.servicePromise) {
       this.startService().catch(err => {
-        workspace.showMessage(`TSServer start failed: ${err.message}`, 'error')
+        window.showMessage(`TSServer start failed: ${err.message}`, 'error')
         this.error(`Service start failed: ${err.stack}`)
       })
     }
@@ -271,9 +285,9 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
     }
     if (!currentVersion || !currentVersion.isValid) {
       if (this.configuration.globalTsdk) {
-        workspace.showMessage(`Can not find typescript module, in 'tsserver.tsdk': ${this.configuration.globalTsdk}`, 'error')
+        window.showMessage(`Can not find typescript module, in 'tsserver.tsdk': ${this.configuration.globalTsdk}`, 'error')
       } else {
-        workspace.showMessage(`Can not find typescript module, run ':CocInstall coc-tsserver' to fix it!`, 'error')
+        window.showMessage(`Can not find typescript module, run ':CocInstall coc-tsserver' to fix it!`, 'error')
       }
       return
     }
@@ -281,7 +295,7 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
     this._tscPath = currentVersion.tscPath
     this.versionStatus.onDidChangeTypeScriptVersion(currentVersion)
     this.lastError = null
-    const tsServerForkArgs = await this.getTsServerArgs()
+    const tsServerForkArgs = await this.getTsServerArgs(currentVersion)
     const debugPort = this._configuration.debugPort
     const maxTsServerMemory = this._configuration.maxTsServerMemory
     const options = {
@@ -314,13 +328,14 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
             this.state = ServiceStat.Running
             this.info('Started TSServer', JSON.stringify(currentVersion, null, 2))
             const handle = new ForkedTsServerProcess(childProcess)
+            this.tsServerProcess = handle
             this.lastStart = Date.now()
 
             handle.onError((err: Error) => {
               this.lastError = err
               this.error('TSServer errored with error.', err)
               this.error(`TSServer log file: ${this.tsServerLogFile || ''}`)
-              workspace.showMessage(`TSServer errored with error. ${err.message}`, 'error')
+              window.showMessage(`TSServer errored with error. ${err.message}`, 'error')
               this.serviceExited(false)
             })
             handle.onExit((code: any) => {
@@ -356,7 +371,7 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
   public async openTsServerLogFile(): Promise<boolean> {
     const isRoot = process.getuid && process.getuid() == 0
     let echoErr = (msg: string) => {
-      workspace.showMessage(msg, 'error')
+      window.showMessage(msg, 'error')
     }
     if (isRoot) {
       echoErr('Log disabled for root user.')
@@ -384,6 +399,7 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
   }
 
   private serviceStarted(resendModels: boolean): void {
+    this.bufferSyncSupport.reset()
     const watchOptions = this.apiVersion.gte(API.v380)
       ? this.configuration.watchOptions
       : undefined
@@ -399,6 +415,7 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
     this.setCompilerOptionsForInferredProjects(this._configuration)
     if (resendModels) {
       this._onResendModelsRequested.fire(void 0)
+      this.fileConfigurationManager.reset()
       this.diagnosticsManager.reInitialize()
       this.bufferSyncSupport.reinitialize()
     }
@@ -446,10 +463,10 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
         if (diff < 10 * 1000 /* 10 seconds */) {
           this.lastStart = Date.now()
           startService = false
-          workspace.showMessage('The TypeScript language service died 5 times right after it got started.', 'error') // tslint:disable-line
+          window.showMessage('The TypeScript language service died 5 times right after it got started.', 'error') // tslint:disable-line
         } else if (diff < 60 * 1000 /* 1 Minutes */) {
           this.lastStart = Date.now()
-          workspace.showMessage('The TypeScript language service died unexpectedly 5 times in the last 5 Minutes.', 'error') // tslint:disable-line
+          window.showMessage('The TypeScript language service died unexpectedly 5 times in the last 5 Minutes.', 'error') // tslint:disable-line
         }
       }
       if (startService) {
@@ -460,6 +477,16 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
 
   public toPath(uri: string): string {
     return this.normalizePath(Uri.parse(uri))
+  }
+
+  public toOpenedFilePath(uri: string, options: { suppressAlertOnFailure?: boolean } = {}): string | undefined {
+    if (!this.bufferSyncSupport.ensureHasBuffer(uri)) {
+      if (!options.suppressAlertOnFailure) {
+        console.error(`Unexpected resource ${uri}`)
+      }
+      return undefined
+    }
+    return this.toPath(uri)
   }
 
   public toResource(filepath: string): string {
@@ -479,22 +506,22 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
     return Uri.file(filepath).toString()
   }
 
-  public normalizePath(resource: Uri): string | null {
-    if (this._apiVersion.gte(API.v213)) {
-      if (resource.scheme == 'untitled') {
-        const dirName = path.dirname(resource.path)
-        const fileName = this.inMemoryResourcePrefix + path.basename(resource.path)
-        return resource
-          .with({ path: path.posix.join(dirName, fileName) })
-          .toString(true)
+  public normalizePath(resource: Uri): string | undefined {
+    if (fileSchemes.disabledSchemes.has(resource.scheme)) {
+      return undefined
+    }
+    switch (resource.scheme) {
+      case fileSchemes.file: {
+        let result = resource.fsPath
+        if (!result) return undefined
+        result = path.normalize(result)
+        // Both \ and / must be escaped in regular expressions
+        return result.replace(new RegExp('\\' + this.pathSeparator, 'g'), '/')
+      }
+      default: {
+        return this.inMemoryResourcePrefix + resource.toString(true)
       }
     }
-
-    const result = resource.fsPath
-    if (!result) return null
-
-    // Both \ and / must be escaped in regular expressions
-    return result.replace(new RegExp('\\' + this.pathSeparator, 'g'), '/')
   }
 
   private get inMemoryResourcePrefix(): string {
@@ -526,13 +553,52 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
   public execute(
     command: string, args: any,
     token: CancellationToken,
-    lowPriority?: boolean): Promise<ServerResponse.Response<Proto.Response>> {
-    return this.executeImpl(command, args, {
-      isAsync: false,
-      token,
-      expectsResult: true,
-      lowPriority
-    })
+    config?: ExecConfig
+  ): Promise<ServerResponse.Response<Proto.Response>> {
+    let execution: Promise<ServerResponse.Response<Proto.Response>>
+
+    if (config?.cancelOnResourceChange) {
+      const source = new CancellationTokenSource()
+      token.onCancellationRequested(() => source.cancel())
+      const inFlight: ToCancelOnResourceChanged = {
+        resource: config.cancelOnResourceChange,
+        cancel: () => source.cancel(),
+      }
+      this.tsServerProcess?.toCancelOnResourceChange.add(inFlight)
+
+      execution = this.executeImpl(command, args, {
+        isAsync: false,
+        token: source.token,
+        expectsResult: true,
+        ...config,
+      }).finally(() => {
+        this.tsServerProcess?.toCancelOnResourceChange.delete(inFlight)
+        source.dispose()
+      })
+    } else {
+      execution = this.executeImpl(command, args, {
+        isAsync: false,
+        token,
+        expectsResult: true,
+        ...config,
+      })
+    }
+
+    if (config?.nonRecoverable) {
+      execution.catch(err => this.fatalError(command, err))
+    }
+    return execution
+  }
+
+  private fatalError(command: string, error: any): void {
+    console.error(`A non-recoverable error occured while executing tsserver command: ${command}`)
+
+    if (this.state === ServiceStat.Running) {
+      this.info('Killing TS Server by fatal error:', error)
+      this.service().then(service => {
+        service.kill()
+      })
+    }
   }
 
   public executeAsync(
@@ -766,7 +832,7 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
     }
   }
 
-  private async getTsServerArgs(): Promise<string[]> {
+  private async getTsServerArgs(currentVersion: TypeScriptVersion): Promise<string[]> {
     const args: string[] = []
     args.push('--allowLocalPluginLoads')
 
@@ -809,13 +875,24 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
 
     if (this.apiVersion.gte(API.v230)) {
       const pluginNames = this.pluginManager.plugins.map(x => x.name)
-      const pluginRoot = this._configuration.tsServerPluginRoot
-      const pluginPaths = pluginRoot ? [pluginRoot] : []
+      let pluginPaths = this._configuration.tsServerPluginPaths
+      pluginPaths = pluginPaths.reduce((p, c) => {
+        if (path.isAbsolute(c)) {
+          p.push(c)
+        } else {
+          let roots = workspace.workspaceFolders.map(o => Uri.parse(o.uri).fsPath)
+          p.push(...roots.map(r => path.join(r, c)))
+        }
+        return p
+      }, [])
 
       if (pluginNames.length) {
+        const isUsingBundledTypeScriptVersion = currentVersion.path == this.versionProvider.bundledVersion.path
         args.push('--globalPlugins', pluginNames.join(','))
         for (const plugin of this.pluginManager.plugins) {
-          pluginPaths.push(plugin.path)
+          if (isUsingBundledTypeScriptVersion || plugin.enableForWorkspaceTypeScriptVersions) {
+            pluginPaths.push(plugin.path)
+          }
         }
       }
 
@@ -824,17 +901,19 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
       }
     }
 
+    if (this._configuration.locale) {
+      args.push('--locale', this._configuration.locale)
+    }
+
     if (this._configuration.typingsCacheLocation) {
       args.push('--globalTypingsCacheLocation', `"${this._configuration.typingsCacheLocation}"`)
     }
 
     if (this.apiVersion.gte(API.v234)) {
-      if (this._configuration.npmLocation) {
-        args.push('--npmLocation', `"${this._configuration.npmLocation}"`)
-      } else {
-        try {
-          args.push('--npmLocation', `"${which.sync('npm')}"`)
-        } catch (e) { } // tslint:disable-line
+      let { npmLocation } = this._configuration
+      if (npmLocation) {
+        this.logger.info(`using npm from ${npmLocation}`)
+        args.push('--npmLocation', `"${npmLocation}"`)
       }
     }
 
@@ -848,21 +927,20 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
     return args
   }
 
-  public getProjectRootPath(uri: string): string | null {
+  public getProjectRootPath(uri: string): string | undefined {
     let root = workspace.cwd
     let u = Uri.parse(uri)
-    if (u.scheme == 'file') {
-      let folder = workspace.getWorkspaceFolder(uri)
-      if (folder) {
-        root = Uri.parse(folder.uri).fsPath
-      } else {
-        let filepath = Uri.parse(uri).fsPath
-        if (!filepath.startsWith(root)) {
-          root = path.dirname(filepath)
-        }
+    if (u.scheme !== 'file') return undefined
+    let folder = workspace.getWorkspaceFolder(uri)
+    if (folder) {
+      root = Uri.parse(folder.uri).fsPath
+    } else {
+      let filepath = Uri.parse(uri).fsPath
+      if (!filepath.startsWith(root)) {
+        root = path.dirname(filepath)
       }
     }
-    if (root == os.homedir()) return null
+    if (root == os.homedir()) return undefined
     return root
   }
 
@@ -878,6 +956,17 @@ export default class TypeScriptServiceClient implements ITypeScriptServiceClient
 
   public interruptGetErr<R>(f: () => R): R {
     return this.bufferSyncSupport.interuptGetErr(f)
+  }
+
+  private cancelInflightRequestsForResource(resource: string): void {
+    if (this.state !== ServiceStat.Running || !this.tsServerProcess) {
+      return
+    }
+    for (const request of this.tsServerProcess.toCancelOnResourceChange) {
+      if (request.resource.toString() === resource.toString()) {
+        request.cancel()
+      }
+    }
   }
 }
 

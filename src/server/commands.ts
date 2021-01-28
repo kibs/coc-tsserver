@@ -1,13 +1,12 @@
-import { Uri as URI, diagnosticManager, workspace, commands } from 'coc.nvim'
-import { CancellationToken, Diagnostic } from 'vscode-languageserver-protocol'
+import { commands, diagnosticManager, CancellationToken, Diagnostic, Disposable, ServiceStat, Uri as URI, window, workspace } from 'coc.nvim'
+import { Range, TextEdit } from 'vscode-languageserver-types'
+import TsserverService from '../server'
+import { PluginManager } from '../utils/plugins'
 import * as Proto from './protocol'
 import TypeScriptServiceClientHost from './typescriptServiceClientHost'
-import * as typeConverters from './utils/typeConverters'
-import { TextEdit, Range } from 'vscode-languageserver-types'
-import { installModules } from './utils/modules'
 import { nodeModules } from './utils/helper'
-import { PluginManager } from '../utils/plugins'
-import { languageIds } from './utils/languageModeIds'
+import { installModules } from './utils/modules'
+import * as typeConverters from './utils/typeConverters'
 
 export interface Command {
   readonly id: string | string[]
@@ -18,12 +17,13 @@ export class ReloadProjectsCommand implements Command {
   public readonly id = 'tsserver.reloadProjects'
 
   public constructor(
-    private readonly client: TypeScriptServiceClientHost
-  ) { }
+    private readonly service: TsserverService
+  ) {}
 
-  public execute(): void {
-    this.client.reloadProjects()
-    workspace.showMessage('projects reloaded')
+  public async execute(): Promise<void> {
+    let client = await this.service.getClientHost()
+    client.reloadProjects()
+    window.showMessage('projects reloaded')
   }
 }
 
@@ -31,11 +31,12 @@ export class OpenTsServerLogCommand implements Command {
   public readonly id = 'tsserver.openTsServerLog'
 
   public constructor(
-    private readonly client: TypeScriptServiceClientHost
-  ) { }
+    private readonly service: TsserverService
+  ) {}
 
-  public execute(): void {
-    this.client.serviceClient.openTsServerLogFile() // tslint:disable-line
+  public async execute(): Promise<void> {
+    let client = await this.service.getClientHost()
+    client.serviceClient.openTsServerLogFile() // tslint:disable-line
   }
 }
 
@@ -43,18 +44,18 @@ export class TypeScriptGoToProjectConfigCommand implements Command {
   public readonly id = 'tsserver.goToProjectConfig'
 
   public constructor(
-    private readonly client: TypeScriptServiceClientHost
-  ) { }
+    private readonly service: TsserverService
+  ) {}
 
   public async execute(): Promise<void> {
+    let client = await this.service.getClientHost()
     let doc = await workspace.document
-    let { filetype } = doc
-    if (languageIds.indexOf(filetype) == -1) {
-      workspace.showMessage(`Could not determine TypeScript or JavaScript project. Unsupported file type: ${filetype}`, 'warning')
+    let { languageId } = doc.textDocument
+    if (client.serviceClient.modeIds.indexOf(languageId) == -1) {
+      throw new Error(`Could not determine TypeScript or JavaScript project. Unsupported file type: ${languageId}`)
       return
     }
-    // doc.filetype
-    await goToProjectConfig(this.client, doc.uri)
+    await goToProjectConfig(client, doc.uri)
   }
 }
 
@@ -68,17 +69,15 @@ async function goToProjectConfig(clientHost: TypeScriptServiceClientHost, uri: s
     // noop
   }
   if (!res || !res.body) {
-    workspace.showMessage('Could not determine TypeScript or JavaScript project.', 'warning')
+    window.showMessage('Could not determine TypeScript or JavaScript project.', 'warning')
     return
   }
-
   const { configFileName } = res.body
   if (configFileName && !isImplicitProjectConfigFile(configFileName)) {
     await workspace.openResource(URI.file(configFileName).toString())
     return
   }
-
-  workspace.showMessage('Config file not found', 'warning')
+  window.showMessage('Config file not found', 'warning')
 }
 
 function isImplicitProjectConfigFile(configFileName: string): boolean {
@@ -94,18 +93,23 @@ const autoFixableDiagnosticCodes = new Set<number>([
 export class AutoFixCommand implements Command {
   public readonly id = 'tsserver.executeAutofix'
 
-  constructor(private client: TypeScriptServiceClientHost) {
+  constructor(private service: TsserverService) {
   }
 
   public async execute(): Promise<void> {
-    let document = await workspace.document
-    let { uri } = document
-    if (!this.client.handles(uri)) {
-      workspace.showMessage(`Document ${uri} is not handled by tsserver.`, 'warning')
+    if (this.service.state != ServiceStat.Running) {
+      throw new Error('service not running')
       return
     }
-    let file = this.client.serviceClient.toPath(document.uri)
-    let diagnostics = diagnosticManager.getDiagnostics(document.uri)
+    let client = await this.service.getClientHost()
+    let document = await workspace.document
+    let handles = await client.handles(document.textDocument)
+    if (!handles) {
+      throw new Error(`Document ${document.uri} is not handled by tsserver.`)
+      return
+    }
+    let file = client.serviceClient.toPath(document.uri)
+    let diagnostics = diagnosticManager.getDiagnostics(document.uri).slice() as Diagnostic[]
     let missingDiagnostics = diagnostics.filter(o => o.code == 2307)
     if (missingDiagnostics.length) {
       let names = missingDiagnostics.map(o => {
@@ -126,7 +130,6 @@ export class AutoFixCommand implements Command {
       arr.push(curr)
       return arr
     }, [] as Diagnostic[])
-    let client = this.client.serviceClient
     let edits: TextEdit[] = []
     let command: string
     let names: string[] = []
@@ -135,7 +138,7 @@ export class AutoFixCommand implements Command {
         ...typeConverters.Range.toFileRangeRequestArgs(file, diagnostic.range),
         errorCodes: [+(diagnostic.code!)]
       }
-      const response = await client.execute('getCodeFixes', args, CancellationToken.None)
+      const response = await client.serviceClient.execute('getCodeFixes', args, CancellationToken.None)
       if (response.type !== 'response' || !response.body || response.body.length < 1) {
         if (diagnostic.code == 2304) {
           let { range } = diagnostic
@@ -164,7 +167,7 @@ export class AutoFixCommand implements Command {
         }
       }
     }
-    if (edits.length) await document.applyEdits(workspace.nvim, edits)
+    if (edits.length) await document.applyEdits(edits)
     if (command) commands.executeCommand(command)
   }
 }
@@ -174,9 +177,14 @@ export class ConfigurePluginCommand implements Command {
 
   public constructor(
     private readonly pluginManager: PluginManager,
-  ) { }
+  ) {}
 
   public execute(pluginId: string, configuration: any): void {
     this.pluginManager.setConfiguration(pluginId, configuration)
   }
+}
+
+export function registCommand(cmd: Command): Disposable {
+  let { id, execute } = cmd
+  return commands.registerCommand(id as string, execute, cmd)
 }

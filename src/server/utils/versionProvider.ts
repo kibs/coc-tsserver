@@ -1,15 +1,12 @@
+import { Uri, window, workspace } from 'coc.nvim'
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 import fs from 'fs'
 import path from 'path'
-import { workspace, Uri } from 'coc.nvim'
 import API from './api'
 import { TypeScriptServiceConfiguration } from './configuration'
-declare var __webpack_require__: any
-declare var __non_webpack_require__: any
-const requireFunc = typeof __webpack_require__ === "function" ? __non_webpack_require__ : require
 
 export class TypeScriptVersion {
   private _api: API | null | undefined
@@ -84,11 +81,11 @@ export class TypeScriptVersion {
   }
 }
 
-const MODULE_FOLDERS = ['node_modules/typescript/lib', '.vscode/pnpify/typescript/lib']
+const MODULE_FOLDERS = ['node_modules/typescript/lib', '.vscode/pnpify/typescript/lib', '.yarn/sdks/typescript/lib']
 
 export class TypeScriptVersionProvider {
 
-  public constructor(private configuration: TypeScriptServiceConfiguration) { }
+  public constructor(private configuration: TypeScriptServiceConfiguration) {}
 
   public updateConfiguration(
     configuration: TypeScriptServiceConfiguration
@@ -105,7 +102,7 @@ export class TypeScriptVersionProvider {
 
   public get globalVersion(): TypeScriptVersion | undefined {
     let { globalTsdk } = this.configuration
-    if (globalTsdk) return new TypeScriptVersion(globalTsdk)
+    if (globalTsdk) return new TypeScriptVersion(workspace.expand(globalTsdk))
     return undefined
   }
 
@@ -125,13 +122,13 @@ export class TypeScriptVersionProvider {
 
   public get bundledVersion(): TypeScriptVersion | null {
     try {
-      const file = requireFunc.resolve('typescript')
+      const file = require.resolve('typescript')
       const bundledVersion = new TypeScriptVersion(
         path.dirname(file),
         '')
       return bundledVersion
     } catch (e) {
-      workspace.showMessage('Bundled typescript module not found', 'error')
+      window.showMessage('Bundled typescript module not found', 'error')
       return null
     }
   }

@@ -5,14 +5,18 @@
 import { Uri, RenameProvider } from 'coc.nvim'
 import path from 'path'
 import { CancellationToken, Position, Range, TextEdit, WorkspaceEdit } from 'vscode-languageserver-protocol'
-import { TextDocument } from 'vscode-languageserver-textdocument'
+import { TextDocument } from 'coc.nvim'
 import * as Proto from '../protocol'
 import { ITypeScriptServiceClient, ServerResponse } from '../typescriptService'
 import API from '../utils/api'
 import * as typeConverters from '../utils/typeConverters'
+import FileConfigurationManager from './fileConfigurationManager'
 
 export default class TypeScriptRenameProvider implements RenameProvider {
-  public constructor(private readonly client: ITypeScriptServiceClient) { }
+  public constructor(
+    private readonly client: ITypeScriptServiceClient,
+    private readonly fileConfigurationManager: FileConfigurationManager
+  ) { }
 
   public async prepareRename(
     document: TextDocument,
@@ -81,6 +85,7 @@ export default class TypeScriptRenameProvider implements RenameProvider {
       findInStrings: false,
       findInComments: false
     }
+    await this.fileConfigurationManager.ensureConfigurationForDocument(document, token)
 
     return this.client.interruptGetErr(() => {
       return this.client.execute('rename', args, token)

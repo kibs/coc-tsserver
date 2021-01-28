@@ -1,22 +1,20 @@
+import { commands, CompletionItemProvider, TextDocument, window, workspace } from 'coc.nvim'
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-import { CancellationToken, Command, CompletionContext, Range, CompletionItem, InsertTextFormat, MarkupContent, MarkupKind, Position, TextEdit, CompletionList } from 'vscode-languageserver-protocol'
-import { TextDocument } from 'vscode-languageserver-textdocument'
-import { commands, workspace } from 'coc.nvim'
-import { CompletionItemProvider } from 'coc.nvim/lib/provider'
+import { CancellationToken, Command, CompletionContext, CompletionItem, CompletionList, InsertTextFormat, MarkupContent, MarkupKind, Position, Range, TextEdit } from 'vscode-languageserver-protocol'
 import Proto from '../protocol'
 import * as PConst from '../protocol.const'
 import { ITypeScriptServiceClient, ServerResponse } from '../typescriptService'
 import API from '../utils/api'
 import { applyCodeAction } from '../utils/codeAction'
-import { DotAccessorContext, convertCompletionEntry, getParameterListParts } from '../utils/completionItem'
+import { convertCompletionEntry, DotAccessorContext, getParameterListParts } from '../utils/completionItem'
 import * as Previewer from '../utils/previewer'
+import SnippetString from '../utils/SnippetString'
 import * as typeConverters from '../utils/typeConverters'
 import TypingsStatus from '../utils/typingsStatus'
 import FileConfigurationManager, { SuggestOptions } from './fileConfigurationManager'
-import SnippetString from '../utils/SnippetString'
 
 // command center
 export interface CommandItem {
@@ -41,7 +39,7 @@ class ApplyCompletionCodeActionCommand implements CommandItem {
       await applyCodeAction(this.client, codeActions[0])
       return
     }
-    const idx = await workspace.showQuickpick(codeActions.map(o => o.description), 'Select code action to apply')
+    const idx = await window.showQuickpick(codeActions.map(o => o.description), 'Select code action to apply')
     if (idx < 0) return
     const action = codeActions[idx]
     await applyCodeAction(this.client, action)
@@ -62,7 +60,10 @@ export default class TypeScriptCompletionItemProvider implements CompletionItemP
   ) {
 
     this.setCompleteOption(languageId)
-    commands.register(new ApplyCompletionCodeActionCommand(this.client))
+    commands.registerCommand(ApplyCompletionCodeActionCommand.ID, async (codeActions) => {
+      let cmd = new ApplyCompletionCodeActionCommand(this.client)
+      await cmd.execute(codeActions)
+    })
     workspace.onDidChangeConfiguration(_e => {
       this.setCompleteOption(languageId)
     })
@@ -110,6 +111,7 @@ export default class TypeScriptCompletionItemProvider implements CompletionItemP
       return null
     }
 
+    await this.client.interruptGetErr(() => this.fileConfigurationManager.ensureConfigurationForDocument(document, token))
     const { completeOption } = this
     const args: Proto.CompletionsRequestArgs & { includeAutomaticOptionalChainCompletions?: boolean } = {
       ...typeConverters.Position.toFileLocationRequestArgs(file, position),
@@ -218,7 +220,7 @@ export default class TypeScriptCompletionItemProvider implements CompletionItemP
   ): Promise<CompletionItem> {
     if (item == null) return undefined
 
-    let { uri, position, source } = item.data
+    let { uri, position, source, name } = item.data
     const filepath = this.client.toPath(uri)
     if (!filepath) return undefined
     let document = workspace.getDocument(uri)
@@ -228,11 +230,7 @@ export default class TypeScriptCompletionItemProvider implements CompletionItemP
         filepath,
         position
       ),
-      entryNames: [
-        source
-          ? { name: item.label, source }
-          : item.label
-      ]
+      entryNames: [source ? { name, source } : name]
     }
 
     let response: ServerResponse.Response<Proto.CompletionDetailsResponse>
@@ -241,7 +239,7 @@ export default class TypeScriptCompletionItemProvider implements CompletionItemP
     } catch {
       return item
     }
-    if (response.type !== 'response' || !response.body) {
+    if (response.type !== 'response' || !response.body || !response.body.length) {
       return item
     }
 

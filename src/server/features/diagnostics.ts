@@ -2,8 +2,8 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+import { DiagnosticCollection, languages, workspace } from 'coc.nvim'
 import { Diagnostic } from 'vscode-languageserver-protocol'
-import { workspace, languages, DiagnosticCollection } from 'coc.nvim'
 import { ResourceMap } from './resourceMap'
 
 export class DiagnosticSet {
@@ -84,6 +84,8 @@ export class DiagnosticsManager {
   ): void {
     const collection = this._diagnostics.get(kind)
     if (!collection) return
+    let doc = workspace.getDocument(uri)
+    if (doc) uri = doc.uri
 
     if (diagnostics.length === 0) {
       const existing = collection.get(uri)

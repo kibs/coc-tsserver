@@ -2,27 +2,24 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-import { workspace, CodeActionProvider, CodeActionProviderMetadata } from 'coc.nvim'
-import { CancellationToken, Range, CodeActionContext, WorkspaceEdit, CodeActionKind, CodeAction } from 'vscode-languageserver-protocol'
-import { TextDocument } from 'vscode-languageserver-textdocument'
+import { CodeActionProvider, CodeActionProviderMetadata, TextDocument, workspace } from 'coc.nvim'
+import { CancellationToken, CodeAction, CodeActionContext, CodeActionKind, Range, TextEdit, WorkspaceEdit } from 'vscode-languageserver-protocol'
+import TsserverService from '../server'
 import { Command } from './commands'
-import Proto from './protocol'
-import { standardLanguageDescriptions } from './utils/languageDescription'
-import { languageIds } from './utils/languageModeIds'
-import * as typeconverts from './utils/typeConverters'
 import FileConfigurationManager from './features/fileConfigurationManager'
+import Proto from './protocol'
 import TypeScriptServiceClient from './typescriptServiceClient'
+import * as typeconverts from './utils/typeConverters'
 
 export class OrganizeImportsCommand implements Command {
   public readonly id: string = 'tsserver.organizeImports'
 
   constructor(
-    private readonly client: TypeScriptServiceClient
+    private readonly service: TsserverService
   ) {
   }
 
-  private async getTextEdits(document: TextDocument): Promise<WorkspaceEdit | null> {
-    let client = this.client
+  private async _execute(client: TypeScriptServiceClient, document: TextDocument): Promise<WorkspaceEdit | TextEdit[] | null> {
     let file = client.toPath(document.uri)
     const args: Proto.OrganizeImportsRequestArgs = {
       scope: {
@@ -32,7 +29,7 @@ export class OrganizeImportsCommand implements Command {
         }
       }
     }
-    const response = await this.client.interruptGetErr(() => this.client.execute('organizeImports', args, CancellationToken.None))
+    const response = await client.interruptGetErr(() => client.execute('organizeImports', args, CancellationToken.None))
     if (!response || response.type != 'response' || !response.success) {
       return
     }
@@ -41,20 +38,30 @@ export class OrganizeImportsCommand implements Command {
       client,
       response.body
     )
-    let desc = standardLanguageDescriptions.find(o => o.modeIds.indexOf(document.languageId) !== -1)
-    if (!desc) return null
-    return edit
+    let keys = Object.keys(edit.changes)
+    if (keys.length == 1) {
+      let doc = workspace.getDocument(keys[0])
+      if (doc) {
+        await doc.applyEdits(edit.changes[keys[0]])
+        return
+      }
+    }
+    if (edit) await workspace.applyEdit(edit)
   }
 
   public async execute(document?: TextDocument): Promise<void> {
+    let client = await this.service.getClientHost()
     if (!document) {
       let doc = await workspace.document
-      if (languageIds.indexOf(doc.filetype) == -1) return
+      if (!doc.attached) {
+        throw new Error(`Document not attached.`)
+      }
+      if (client.serviceClient.modeIds.indexOf(doc.filetype) == -1) {
+        throw new Error(`filetype "${doc.filetype}" not supported by tsserver.`)
+      }
       document = doc.textDocument
     }
-    let edit = await this.getTextEdits(document)
-    if (edit) await workspace.applyEdit(edit)
-    return
+    await this._execute(client.serviceClient, document)
   }
 }
 
@@ -71,17 +78,18 @@ export class OrganizeImportsCodeActionProvider implements CodeActionProvider {
     providedCodeActionKinds: [CodeActionKind.SourceOrganizeImports]
   }
 
-  public provideCodeActions(
+  public async provideCodeActions(
     document: TextDocument,
     _range: Range,
     context: CodeActionContext,
-    _token: CancellationToken
-  ): CodeAction[] {
-    if (languageIds.indexOf(document.languageId) == -1) return
+    token: CancellationToken
+  ): Promise<CodeAction[]> {
+    if (this.client.modeIds.indexOf(document.languageId) == -1) return
 
     if (!context.only || !context.only.includes(CodeActionKind.SourceOrganizeImports)) {
       return []
     }
+    await this.fileConfigManager.ensureConfigurationForDocument(document, token)
 
     const action = CodeAction.create('Organize Imports', {
       title: '',

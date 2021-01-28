@@ -2,16 +2,21 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-import { Uri, DiagnosticKind, disposeAll, workspace } from 'coc.nvim'
-import { Range, Diagnostic, DiagnosticSeverity, Disposable, Position, CancellationToken, DiagnosticRelatedInformation } from 'vscode-languageserver-protocol'
+import { disposeAll, languages, TextDocument, Uri, workspace } from 'coc.nvim'
+import { CancellationToken, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Disposable, Position, Range } from 'vscode-languageserver-protocol'
+import { flatten } from '../utils/arrays'
+import { PluginManager } from '../utils/plugins'
+import { DiagnosticKind } from './features/diagnostics'
+import FileConfigurationManager from './features/fileConfigurationManager'
+import WatchBuild from './features/watchBuild'
+import WorkspaceSymbolProvider from './features/workspaceSymbols'
 import LanguageProvider from './languageProvider'
 import * as Proto from './protocol'
 import * as PConst from './protocol.const'
 import TypeScriptServiceClient from './typescriptServiceClient'
-import { LanguageDescription } from './utils/languageDescription'
+import { DiagnosticLanguage, LanguageDescription } from './utils/languageDescription'
 import * as typeConverters from './utils/typeConverters'
 import TypingsStatus, { AtaProgressReporter } from './utils/typingsStatus'
-import { PluginManager } from '../utils/plugins'
 
 // Style check diagnostics that can be reported as warnings
 const styleCheckDiagnostics = [
@@ -27,9 +32,9 @@ export default class TypeScriptServiceClientHost implements Disposable {
   private readonly ataProgressReporter: AtaProgressReporter
   private readonly typingsStatus: TypingsStatus
   private readonly client: TypeScriptServiceClient
-  private readonly languages: LanguageProvider[] = []
   private readonly languagePerId = new Map<string, LanguageProvider>()
   private readonly disposables: Disposable[] = []
+  private readonly fileConfigurationManager: FileConfigurationManager
   private reportStyleCheckAsWarnings = true
 
   constructor(descriptions: LanguageDescription[], pluginManager: PluginManager) {
@@ -50,12 +55,18 @@ export default class TypeScriptServiceClientHost implements Disposable {
     packageFileWatcher.onDidCreate(this.reloadProjects, this, this.disposables)
     packageFileWatcher.onDidChange(handleProjectChange, this, this.disposables)
 
-    this.client = new TypeScriptServiceClient(pluginManager)
+    const allModeIds = this.getAllModeIds(descriptions, pluginManager)
+    this.client = new TypeScriptServiceClient(pluginManager, allModeIds)
     this.disposables.push(this.client)
     this.client.onDiagnosticsReceived(({ kind, resource, diagnostics }) => {
-      this.diagnosticsReceived(kind, resource, diagnostics)
+      this.diagnosticsReceived(kind, resource, diagnostics).catch(e => {
+        console.error(e)
+      })
     }, null, this.disposables)
 
+    // features
+    this.disposables.push(new WatchBuild(this.client))
+    this.disposables.push(languages.registerWorkspaceSymbolProvider(new WorkspaceSymbolProvider(this.client, allModeIds)))
     this.client.onConfigDiagnosticsReceived(diag => {
       let { body } = diag
       if (body) {
@@ -79,18 +90,45 @@ export default class TypeScriptServiceClientHost implements Disposable {
         }
       }
     }, null, this.disposables)
-
     this.typingsStatus = new TypingsStatus(this.client)
     this.ataProgressReporter = new AtaProgressReporter(this.client)
+    this.fileConfigurationManager = new FileConfigurationManager(this.client)
     for (const description of descriptions) { // tslint:disable-line
       const manager = new LanguageProvider(
         this.client,
+        this.fileConfigurationManager,
         description,
         this.typingsStatus
       )
-      this.languages.push(manager)
-      this.disposables.push(manager)
       this.languagePerId.set(description.id, manager)
+    }
+    const languageIds = new Set<string>()
+    for (const plugin of pluginManager.plugins) {
+      if (plugin.configNamespace && plugin.languages.length) {
+        this.registerExtensionLanguageProvider({
+          id: plugin.configNamespace,
+          modeIds: Array.from(plugin.languages),
+          diagnosticSource: 'ts-plugin',
+          diagnosticLanguage: DiagnosticLanguage.TypeScript,
+          diagnosticOwner: 'typescript',
+          isExternal: true
+        })
+      } else {
+        for (const language of plugin.languages) {
+          languageIds.add(language)
+        }
+      }
+    }
+
+    if (languageIds.size) {
+      this.registerExtensionLanguageProvider({
+        id: 'typescript-plugins',
+        modeIds: Array.from(languageIds.values()),
+        diagnosticSource: 'ts-plugin',
+        diagnosticLanguage: DiagnosticLanguage.TypeScript,
+        diagnosticOwner: 'typescript',
+        isExternal: true
+      })
     }
 
     this.client.ensureServiceStarted()
@@ -101,16 +139,24 @@ export default class TypeScriptServiceClientHost implements Disposable {
     this.configurationChanged()
   }
 
+  private registerExtensionLanguageProvider(description: LanguageDescription) {
+    const manager = new LanguageProvider(this.client, this.fileConfigurationManager, description, this.typingsStatus)
+    this.languagePerId.set(description.id, manager)
+  }
+
   public dispose(): void {
     disposeAll(this.disposables)
+    for (let language of this.languagePerId.values()) {
+      language.dispose()
+    }
+    this.languagePerId.clear()
+    this.fileConfigurationManager.dispose()
     this.typingsStatus.dispose()
     this.ataProgressReporter.dispose()
   }
 
   public reset(): void {
-    for (let lang of this.languages) {
-      lang.fileConfigurationManager.reset()
-    }
+    this.fileConfigurationManager.reset()
   }
 
   public get serviceClient(): TypeScriptServiceClient {
@@ -118,6 +164,7 @@ export default class TypeScriptServiceClientHost implements Disposable {
   }
 
   public reloadProjects(): void {
+    this.client.diagnosticsManager.reInitialize()
     this.client.execute('reloadProjects', null, CancellationToken.None)
     this.triggerAllDiagnostics()
   }
@@ -132,16 +179,22 @@ export default class TypeScriptServiceClientHost implements Disposable {
     this.reportStyleCheckAsWarnings = config.get('reportStyleChecksAsWarnings', true)
   }
 
-  public findLanguage(resource: Uri): LanguageProvider | null {
+  public async findLanguage(uri: string): Promise<LanguageProvider> {
     try {
-      return this.languages.find(language => language.handles(resource))
+      let doc = await workspace.loadFile(uri)
+      if (!doc) return undefined
+      let languages = Array.from(this.languagePerId.values())
+      return languages.find(language => language.handles(uri, doc.textDocument))
     } catch {
-      return null
+      return undefined
     }
   }
 
-  public handles(uri: string): boolean {
-    return this.findLanguage(Uri.parse(uri)) != null
+  public async handles(doc: TextDocument): Promise<boolean> {
+    let languages = Array.from(this.languagePerId.values())
+    let idx = languages.findIndex(language => language.handles(doc.uri, doc))
+    if (idx != -1) return true
+    return this.client.bufferSyncSupport.handles(doc.uri)
   }
 
   private triggerAllDiagnostics(): void {
@@ -150,12 +203,12 @@ export default class TypeScriptServiceClientHost implements Disposable {
     }
   }
 
-  private diagnosticsReceived(
+  private async diagnosticsReceived(
     kind: DiagnosticKind,
     resource: Uri,
     diagnostics: Proto.Diagnostic[]
-  ): void {
-    const language = this.findLanguage(resource)
+  ): Promise<void> {
+    const language = await this.findLanguage(resource.toString())
     if (language) {
       language.diagnosticsReceived(
         kind,
@@ -221,5 +274,13 @@ export default class TypeScriptServiceClientHost implements Disposable {
 
   private isStyleCheckDiagnostic(code: number | undefined): boolean {
     return code ? styleCheckDiagnostics.indexOf(code) !== -1 : false
+  }
+
+  private getAllModeIds(descriptions: LanguageDescription[], pluginManager: PluginManager): string[] {
+    const allModeIds = flatten([
+      ...descriptions.map(x => x.modeIds),
+      ...pluginManager.plugins.map(x => x.languages)
+    ])
+    return allModeIds
   }
 }

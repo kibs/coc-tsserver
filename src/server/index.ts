@@ -1,9 +1,8 @@
-import { Uri, disposeAll, IServiceProvider, ServiceStat, workspace, WorkspaceConfiguration } from 'coc.nvim'
+import { disposeAll, IServiceProvider, ServiceStat, workspace, WorkspaceConfiguration } from 'coc.nvim'
 import { Disposable, DocumentSelector, Emitter, Event } from 'vscode-languageserver-protocol'
+import { PluginManager } from '../utils/plugins'
 import TypeScriptServiceClientHost from './typescriptServiceClientHost'
 import { LanguageDescription, standardLanguageDescriptions } from './utils/languageDescription'
-import { PluginManager } from '../utils/plugins'
-import { TextDocument } from 'vscode-languageserver-textdocument'
 
 export default class TsserverService implements IServiceProvider {
   public id = 'tsserver'
@@ -28,21 +27,27 @@ export default class TsserverService implements IServiceProvider {
     this.selector = this.descriptions.reduce((arr, c) => {
       return arr.concat(c.modeIds)
     }, [])
-    workspace.onDidOpenTextDocument(doc => {
-      this.ensureConfigurationForDocument(doc)
-    }, null, this.disposables)
   }
 
   public get config(): WorkspaceConfiguration {
     return workspace.getConfiguration('tsserver')
   }
 
-  public ensureConfigurationForDocument(document: TextDocument): void {
-    let uri = Uri.parse(document.uri)
-    let language = this.clientHost.findLanguage(uri)
-    if (!language) return
-    language.fileConfigurationManager.ensureConfigurationForDocument(document).catch(_e => {
-      // noop
+  /**
+   * Get running client host.
+   */
+  public getClientHost(): Promise<TypeScriptServiceClientHost> {
+    if (this.state == ServiceStat.Running) return Promise.resolve(this.clientHost)
+    this.start()
+    return new Promise((resolve, reject) => {
+      let timer = setTimeout(() => {
+        reject(new Error(`Server not started after 5s`))
+      }, 5000)
+      let disposable = this.onServiceReady(() => {
+        clearTimeout(timer)
+        disposable.dispose()
+        resolve(this.clientHost)
+      })
     })
   }
 
@@ -61,20 +66,12 @@ export default class TsserverService implements IServiceProvider {
           }
         })
         this._onDidServiceReady.fire(void 0)
-        this.ensureConfiguration()
         if (!started) {
           started = true
           resolve()
         }
       })
     })
-  }
-
-  private ensureConfiguration(): void {
-    if (!this.clientHost) return
-    for (let doc of workspace.documents) {
-      this.ensureConfigurationForDocument(doc.textDocument)
-    }
   }
 
   public dispose(): void {

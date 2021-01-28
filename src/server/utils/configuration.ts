@@ -73,8 +73,8 @@ export class TypeScriptServiceConfiguration {
     return this._configuration.get<string>('typingsCacheLocation', '')
   }
 
-  public get tsServerPluginRoot(): string | null {
-    return this._configuration.get<string | null>('tsServerPluginRoot', null)
+  public get tsServerPluginPaths(): string[] {
+    return this._configuration.get<string[]>('pluginPaths', [])
   }
 
   public get checkJs(): boolean {
@@ -103,7 +103,7 @@ export class TypeScriptServiceConfiguration {
 
   public get npmLocation(): string | null {
     let path = this._configuration.get<string>('npm', '')
-    if (path) return path
+    if (path) return workspace.expand(path)
     try {
       path = which.sync('npm')
     } catch (e) {

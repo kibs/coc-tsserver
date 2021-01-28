@@ -1,22 +1,26 @@
+import { CodeActionProvider, CodeActionProviderMetadata, commands, TextDocument, window, workspace } from 'coc.nvim'
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 import { CancellationToken, CodeAction, CodeActionContext, CodeActionKind, Range, WorkspaceEdit } from 'vscode-languageserver-protocol'
-import { TextDocument } from 'vscode-languageserver-textdocument'
-import { Command } from 'coc.nvim/lib/commands'
-import { CodeActionProvider, CodeActionProviderMetadata } from 'coc.nvim/lib/provider'
-import { workspace, commands } from 'coc.nvim'
+import { Command, registCommand } from '../commands'
 import Proto from '../protocol'
 import { ITypeScriptServiceClient } from '../typescriptService'
 import * as typeConverters from '../utils/typeConverters'
 import FormattingOptionsManager from './fileConfigurationManager'
 
+namespace Experimental {
+  export interface RefactorActionInfo extends Proto.RefactorActionInfo {
+    readonly notApplicableReason?: string
+  }
+}
+
 class ApplyRefactoringCommand implements Command {
   public static readonly ID = '_typescript.applyRefactoring'
   public readonly id = ApplyRefactoringCommand.ID
 
-  constructor(private readonly client: ITypeScriptServiceClient) { }
+  constructor(private readonly client: ITypeScriptServiceClient) {}
 
   public async execute(
     document: TextDocument,
@@ -66,7 +70,7 @@ class SelectRefactorCommand implements Command {
   public static readonly ID = '_typescript.selectRefactoring'
   public readonly id = SelectRefactorCommand.ID
 
-  constructor(private readonly doRefactoring: ApplyRefactoringCommand) { }
+  constructor(private readonly doRefactoring: ApplyRefactoringCommand) {}
 
   public async execute(
     document: TextDocument,
@@ -75,7 +79,7 @@ class SelectRefactorCommand implements Command {
     range: Range
   ): Promise<boolean> {
     let { actions } = info
-    const idx = actions.length == 1 ? 0 : await workspace.showQuickpick(
+    const idx = actions.length == 1 ? 0 : await window.showQuickpick(
       actions.map(action => action.description || action.name)
     )
     if (idx == -1) return false
@@ -100,10 +104,9 @@ export default class TypeScriptRefactorProvider implements CodeActionProvider {
     private readonly client: ITypeScriptServiceClient,
     private readonly formattingOptionsManager: FormattingOptionsManager,
   ) {
-    const doRefactoringCommand = commands.register(
-      new ApplyRefactoringCommand(this.client)
-    )
-    commands.register(new SelectRefactorCommand(doRefactoringCommand))
+    const doRefactoringCommand = new ApplyRefactoringCommand(this.client)
+    registCommand(doRefactoringCommand)
+    registCommand(new SelectRefactorCommand(doRefactoringCommand))
   }
 
   public static readonly metadata: CodeActionProviderMetadata = {
@@ -121,7 +124,7 @@ export default class TypeScriptRefactorProvider implements CodeActionProvider {
     }
     const file = this.client.toPath(document.uri)
     if (!file) return undefined
-    await this.formattingOptionsManager.ensureConfigurationForDocument(document)
+    await this.formattingOptionsManager.ensureConfigurationForDocument(document, token)
     const args: Proto.GetApplicableRefactorsRequestArgs = typeConverters.Range.toFileRangeRequestArgs(
       file,
       range
@@ -142,7 +145,8 @@ export default class TypeScriptRefactorProvider implements CodeActionProvider {
       response.body,
       document,
       file,
-      range
+      range,
+      context.only && context.only.some(v => v.includes(CodeActionKind.Refactor))
     )
   }
 
@@ -150,10 +154,13 @@ export default class TypeScriptRefactorProvider implements CodeActionProvider {
     body: Proto.ApplicableRefactorInfo[],
     document: TextDocument,
     file: string,
-    rangeOrSelection: Range
+    rangeOrSelection: Range,
+    setPrefrred: boolean
   ): CodeAction[] {
     const actions: CodeAction[] = []
     for (const info of body) {
+      // ignore not refactor that not applicable
+      if ((info as Experimental.RefactorActionInfo).notApplicableReason) continue
       if (!info.inlineable) {
         const codeAction: CodeAction = {
           title: info.description,
@@ -167,15 +174,11 @@ export default class TypeScriptRefactorProvider implements CodeActionProvider {
         actions.push(codeAction)
       } else {
         for (const action of info.actions) {
-          actions.push(
-            this.refactorActionToCodeAction(
-              action,
-              document,
-              file,
-              info,
-              rangeOrSelection
-            )
-          )
+          let codeAction = this.refactorActionToCodeAction(action, document, file, info, rangeOrSelection)
+          if (setPrefrred) {
+            codeAction.isPreferred = TypeScriptRefactorProvider.isPreferred(action, info.actions)
+          }
+          actions.push(codeAction)
         }
       }
     }
@@ -204,7 +207,7 @@ export default class TypeScriptRefactorProvider implements CodeActionProvider {
   private shouldTrigger(context: CodeActionContext): boolean {
     if (
       context.only &&
-      context.only.indexOf(CodeActionKind.Refactor) == -1
+      context.only.every(o => !o.includes(CodeActionKind.Refactor))
     ) {
       return false
     }
@@ -220,5 +223,35 @@ export default class TypeScriptRefactorProvider implements CodeActionProvider {
       return TypeScriptRefactorProvider.moveKind
     }
     return CodeActionKind.Refactor
+  }
+
+  private static isPreferred(
+    action: Proto.RefactorActionInfo,
+    allActions: readonly Proto.RefactorActionInfo[],
+  ): boolean {
+    let kind = TypeScriptRefactorProvider.getKind(action)
+    if (TypeScriptRefactorProvider.extractConstantKind == kind) {
+      // Only mark the action with the lowest scope as preferred
+      const getScope = (name: string) => {
+        const scope = name.match(/scope_(\d)/)?.[1]
+        return scope ? +scope : undefined
+      }
+      const scope = getScope(action.name)
+      if (typeof scope !== 'number') {
+        return false
+      }
+
+      return allActions
+        .filter(otherAtion => otherAtion !== action && otherAtion.name.startsWith('constant_'))
+        .every(otherAction => {
+          const otherScope = getScope(otherAction.name)
+          return typeof otherScope === 'number' ? scope < otherScope : true
+        })
+    }
+    let { name } = action
+    if (name.startsWith('Extract to type alias') || name.startsWith('Extract to interface')) {
+      return true
+    }
+    return false
   }
 }
